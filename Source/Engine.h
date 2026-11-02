@@ -12,15 +12,21 @@ namespace prisma
 {
 
 constexpr int numVoices = 8;
-constexpr int maxGrains = 64;
+constexpr int maxGrains = 32;      // per voice
 constexpr int firstPadNote = 36;   // C1 in Ableton
 
-inline juce::StringArray rateNames()  { return { "Off", "1/1", "1/2", "1/4D", "1/4", "1/4T", "1/8D", "1/8", "1/8T", "1/16D", "1/16", "1/16T", "1/32", "1/64" }; }
+// Grain trigger rate (synced to the project grid)
+inline juce::StringArray rateNames()  { return { "1/1", "1/2", "1/4D", "1/4", "1/4T", "1/8D", "1/8", "1/8T", "1/16D", "1/16", "1/16T", "1/32", "1/32T", "1/64" }; }
+constexpr int numRates = 14;
+constexpr int defaultRate = 9;     // 1/16
 inline double rateBeats (int r)
 {
-    static const double b[] = { 0.0, 4.0, 2.0, 1.5, 1.0, 2.0 / 3.0, 0.75, 0.5, 1.0 / 3.0, 0.375, 0.25, 1.0 / 6.0, 0.125, 0.0625 };
-    return b[juce::jlimit (0, 13, r)];
+    static const double b[] = { 4.0, 2.0, 1.5, 1.0, 2.0 / 3.0, 0.75, 0.5, 1.0 / 3.0, 0.375, 0.25, 1.0 / 6.0, 0.125, 1.0 / 12.0, 0.0625 };
+    return b[juce::jlimit (0, numRates - 1, r)];
 }
+inline juce::StringArray shapeNames()    { return { "Square", "Soft", "Pluck", "Swell" }; }
+enum Shape { ShapeSquare = 0, ShapeSoft, ShapePluck, ShapeSwell };
+
 inline juce::StringArray divideNames()   { return { "Grid", "Equal", "Transients" }; }
 inline juce::StringArray gridDivNames()  { return { "1/1", "1/2", "1/4", "1/8", "1/16", "1/32" }; }
 inline double gridDivBeats (int i)       { static const double b[] = { 4.0, 2.0, 1.0, 0.5, 0.25, 0.125 }; return b[juce::jlimit (0, 5, i)]; }
@@ -38,16 +44,19 @@ inline juce::String noteName (int note)
 // Global (automatable) settings, read once per block.
 struct Params
 {
-    int rate = 0; float length = 1.0f;
-    float grainMs = 80.0f, density = 30.0f, scan = 1.0f, spread = 0.05f, chaos = 0.0f, pitch = 0.0f;
+    bool sync = true; int rate = defaultRate; float hz = 8.0f;
+    float lengthMs = 160.0f; int shape = ShapeSquare;
+    float position = 0.0f, scan = 1.0f, chaos = 0.0f, space = 0.3f, pitch = 0.0f;
     float attack = 0.003f, decayTime = 0.3f, sustain = 1.0f, release = 0.2f;
 };
+
+constexpr float minLengthMs = 10.0f, maxLengthMs = 1000.0f;
 
 // Per-pad settings; written by the UI, read by the audio thread.
 struct PadState
 {
-    std::array<std::atomic<float>, maxPads> start {}, end {}, length {}, gain {};
-    std::array<std::atomic<int>, maxPads> rate {}, reverse {};   // rate: -1 = linked to global
+    std::array<std::atomic<float>, maxPads> start {}, end {}, length {}, gain {};   // length: ms, < 0 = linked
+    std::array<std::atomic<int>, maxPads> rate {}, reverse {};                      // rate: -1 = linked to global
     std::atomic<int> count { 0 };
 
     PadState()
@@ -55,7 +64,7 @@ struct PadState
         for (int i = 0; i < maxPads; ++i)
         {
             start[(size_t) i] = 0.0f; end[(size_t) i] = 1.0f;
-            length[(size_t) i] = -1.0f; gain[(size_t) i] = 1.0f;   // length: < 0 = linked
+            length[(size_t) i] = -1.0f; gain[(size_t) i] = 1.0f;
             rate[(size_t) i] = -1; reverse[(size_t) i] = 0;
         }
     }
@@ -66,12 +75,13 @@ struct PadState
     }
 };
 
-// Activity the display reads.
+// Activity the display reads (lock-free rings).
 struct Activity
 {
     static constexpr int size = 512;
-    std::array<std::atomic<float>, size> grainPos {};
+    std::array<std::atomic<float>, size> grainPos {}, grainLen {}, grainPan {};   // pos/len normalised to the sample
     std::array<std::atomic<int>, size> grainPad {}, grainPitch {};
+    std::array<std::atomic<double>, size> grainTime {};                            // seconds since start (audio clock)
     std::atomic<int> grainWrite { 0 };
 
     static constexpr int restartSize = 64;
@@ -81,11 +91,14 @@ struct Activity
     std::array<std::atomic<int>, numVoices> voicePad {};
     std::array<std::atomic<float>, numVoices> voicePos {}, voiceLevel {};
     std::atomic<int> lastPad { -1 };
+    std::atomic<double> clock { 0.0 };   // audio time in seconds
 
     Activity() { for (auto& v : voicePad) v = -1; }
 };
 
 //==============================================================================
+// Rhythmic grain engine: long grains (10 ms .. 1 s) fired on the project grid
+// (or a free rate), read at original speed from a head that scans through the pad.
 class GrainEngine
 {
 public:
@@ -110,13 +123,21 @@ public:
         auto& v = *t;
         const bool reuse = v.active;
         const float oldEnv = v.env;
-        const auto oldGrains = v.grains;
+        auto oldGrains = v.grains;
         v = Voice();
-        if (reuse) { v.env = oldEnv; v.grains = oldGrains; }   // let old grains ring out, no click
+        if (reuse)
+        {
+            v.env = oldEnv;
+            v.grains = oldGrains;
+            for (auto& g : v.grains) if (g.active) g.fadeOut (fadeSamples());   // old grains fade quickly, no click
+        }
         v.active = true; v.held = true; v.note = note; v.pad = pad;
         v.velocity = 0.3f + 0.7f * vel;
         v.rng.setSeed ((juce::int64) note * 7919 + (++seed) * 104729);
-        restart (v, s, ppqNow, true);
+        setupRegion (v, s, true);
+        v.rate = effectiveRate (pad);
+        if (v.rate >= 0) v.lastTick = (juce::int64) std::floor (ppqNow / rateBeats (v.rate) + 1.0e-9);
+        v.fireNow = true;
         if (act != nullptr) act->lastPad.store (pad);
     }
 
@@ -133,44 +154,70 @@ public:
 
     void render (float* L, float* R, int n, const Params& p, const Sample& s, double bpm, double ppqStart, double ppqPerSample)
     {
+        globals = p; lastBpm = bpm;
         const double attackStep = 1.0 / juce::jmax (1.0, (double) p.attack * sr);
         const double decayCoef = std::exp (-6.9 / juce::jmax (1.0, (double) p.decayTime * sr));
         const double releaseCoef = std::exp (-6.9 / juce::jmax (1.0, (double) p.release * sr));
-        const double gateStep = 1.0 / (0.003 * sr);
-        const double grainLen = juce::jmax (0.005, p.grainMs * 0.001) * sr;
-        const float norm = 1.25f / std::sqrt (juce::jmax (1.0f, p.density * p.grainMs * 0.001f));
         const double srcRatio = s.sampleRate / sr;
+        const auto* SL = s.audio.getReadPointer (0);
+        const auto* SR = s.audio.getReadPointer (1);
+        const int slen = s.length();
 
         for (int vi = 0; vi < numVoices; ++vi)
         {
             auto& v = voices[(size_t) vi];
             if (! v.active) continue;
 
-            // effective settings for this pad (own value or the global one)
-            const int padRate = pads->rate[(size_t) v.pad].load();
-            const int rate = padRate >= 0 ? padRate : p.rate;
-            const double beats = rateBeats (rate);
-            const double interval = beats * 60.0 / bpm * sr;
-            if (rate != v.rate) { v.rate = rate; v.lastTick = beats > 0.0 ? (juce::int64) std::floor (ppqStart / beats + 1.0e-9) : 0; }
+            // effective trigger rate for this pad: synced division, or free Hz
+            const int rate = effectiveRate (v.pad);
+            const double beats = rate >= 0 ? rateBeats (rate) : 0.0;
+            const double interval = rate >= 0 ? beats * 60.0 / bpm * sr : sr / juce::jmax (0.1, (double) p.hz);
+            if (rate != v.rate)
+            {
+                v.rate = rate;
+                if (rate >= 0) v.lastTick = (juce::int64) std::floor (ppqStart / beats + 1.0e-9);
+            }
+            const double lenSamples = juce::jlimit ((double) minLengthMs, (double) maxLengthMs, (double) effectiveLength (v.pad)) * 0.001 * sr;
+            // overlapping grains are summed: keep loudness steady
+            const float norm = 1.0f / std::sqrt ((float) juce::jmax (1.0, lenSamples / juce::jmax (1.0, interval)));
 
-            // grid ticks for this voice inside this segment
+            // trigger points inside this segment
             std::array<int, 64> ticks {};
             int numTicks = 0;
-            if (beats > 0.0 && v.held && ppqPerSample > 0.0)
-                for (juce::int64 g = v.lastTick + 1; numTicks < (int) ticks.size(); ++g)
+            const double since0 = v.fireNow ? 0.0 : v.sinceTrigger;
+            if (v.fireNow) { ticks[(size_t) numTicks++] = 0; v.fireNow = false; }
+            if (v.held)
+            {
+                if (rate >= 0 && ppqPerSample > 0.0)
                 {
-                    const int at = (int) std::ceil ((g * beats - ppqStart) / ppqPerSample - 1.0e-6);
-                    if (at >= n) break;
-                    ticks[(size_t) numTicks++] = juce::jmax (0, at);
-                    v.lastTick = g;
+                    for (juce::int64 g = v.lastTick + 1; numTicks < (int) ticks.size(); ++g)
+                    {
+                        const int at = (int) std::ceil ((g * beats - ppqStart) / ppqPerSample - 1.0e-6);
+                        if (at >= n) break;
+                        v.lastTick = g;
+                        if (since0 + juce::jmax (0, at) < interval * 0.5) continue;   // too close to the note-on grain
+                        ticks[(size_t) numTicks++] = juce::jmax (0, at);
+                    }
                 }
+                else if (rate < 0)
+                {
+                    double next = interval - since0;
+                    while (next < n && numTicks < (int) ticks.size())
+                    {
+                        const int at = juce::jmax (0, (int) std::ceil (next - 1.0e-6));
+                        if (at >= n) break;
+                        ticks[(size_t) numTicks++] = at;
+                        next += interval;
+                    }
+                }
+            }
             int tickIdx = 0;
 
             for (int i = 0; i < n; ++i)
             {
                 while (tickIdx < numTicks && ticks[(size_t) tickIdx] == i)
                 {
-                    if (v.held && v.sinceRestart >= interval * 0.5) restart (v, s, ppqStart + i * ppqPerSample, false);
+                    trigger (v, p, s, lenSamples, srcRatio);
                     ++tickIdx;
                 }
 
@@ -185,28 +232,7 @@ public:
                 }
                 if (v.envStage == 3 && v.env < 1.0e-4f) { v.active = false; break; }
 
-                // rhythmic gate
-                if (beats > 0.0 && v.gateOpen)
-                {
-                    v.gateLeft -= 1.0;
-                    if (v.gateLeft <= 0.0) v.gateOpen = false;
-                }
-                const double target = (v.gateOpen || beats <= 0.0) ? 1.0 : 0.0;
-                if (v.gate < target) v.gate = juce::jmin (target, v.gate + gateStep);
-                else if (v.gate > target) v.gate = juce::jmax (target, v.gate - gateStep * 0.75);
-
-                // spawn grains while the gate is open
-                if (v.gate > 0.0)
-                {
-                    v.grainAcc += p.density / sr;
-                    while (v.grainAcc >= 1.0)
-                    {
-                        v.grainAcc -= 1.0;
-                        spawn (v, p, s, grainLen, srcRatio);
-                    }
-                }
-
-                // advance the read head through the region
+                // the head scans through the region at original speed (scan 1x) or slower / frozen
                 const double regionLen = juce::jmax (8.0, v.regionEnd - v.regionStart);
                 v.head += v.dir * p.scan * srcRatio;
                 if (v.head >= v.regionEnd) v.head -= regionLen * std::floor ((v.head - v.regionStart) / regionLen);
@@ -214,73 +240,129 @@ public:
 
                 // sum grains
                 float l = 0.0f, r = 0.0f;
-                const auto* SL = s.audio.getReadPointer (0);
-                const auto* SR = s.audio.getReadPointer (1);
-                const int slen = s.length();
                 for (auto& g : v.grains)
                 {
                     if (! g.active) continue;
-                    const double ph = g.age / g.length;
-                    const float w = (float) std::sin (juce::MathConstants<double>::pi * ph);
-                    const float win = w * w;
-                    const double pos = g.pos;
-                    if (pos >= 0.0 && pos < slen - 1)
+                    const float w = g.envelope();
+                    const double pl = g.pos, pr = g.pos + g.offsetR;
+                    if (pl >= 0.0 && pl < slen - 1 && pr >= 0.0 && pr < slen - 1)
                     {
-                        const int i0 = (int) pos;
-                        const float f = (float) (pos - i0);
-                        const float a = SL[i0] + f * (SL[i0 + 1] - SL[i0]);
-                        const float b = SR[i0] + f * (SR[i0 + 1] - SR[i0]);
-                        l += a * win * g.panL;
-                        r += b * win * g.panR;
+                        const int i0 = (int) pl, i1 = (int) pr;
+                        const float fl = (float) (pl - i0), fr = (float) (pr - i1);
+                        l += (SL[i0] + fl * (SL[i0 + 1] - SL[i0])) * w * g.panL;
+                        r += (SR[i1] + fr * (SR[i1 + 1] - SR[i1])) * w * g.panR;
                     }
                     g.pos += g.step;
-                    g.age += 1.0;
-                    if (g.age >= g.length) g.active = false;
+                    g.advance();
                 }
 
-                const float amp = v.env * v.velocity * v.gain * (float) v.gate * norm * 0.7f;
+                const float amp = v.env * v.velocity * v.gain * norm * 0.8f;
                 L[i] += l * amp;
                 R[i] += r * amp;
-                v.sinceRestart += 1.0;
+                v.sinceTrigger += 1.0;
                 ++v.age;
             }
         }
-        publish (s);
     }
 
-    void publish (const Sample& s)
+    void publish (const Sample& s, double clockSeconds)
     {
         if (act == nullptr) return;
+        clock = clockSeconds;
+        act->clock.store (clockSeconds);
         for (int i = 0; i < numVoices; ++i)
         {
             const auto& v = voices[(size_t) i];
             act->voicePad[(size_t) i].store (v.active ? v.pad : -1);
             act->voicePos[(size_t) i].store ((float) (v.head / juce::jmax (1, s.length())));
-            act->voiceLevel[(size_t) i].store (v.active ? v.env * (float) v.gate : 0.0f);
+            act->voiceLevel[(size_t) i].store (v.active ? v.env : 0.0f);
         }
+    }
+
+    // How many grains are sounding (tests)
+    int activeGrains() const
+    {
+        int c = 0;
+        for (auto& v : voices) if (v.active) for (auto& g : v.grains) c += g.active ? 1 : 0;
+        return c;
     }
 
 private:
     struct Grain
     {
         bool active = false;
-        double pos = 0.0, step = 1.0, age = 0.0, length = 1.0;
-        float panL = 1.0f, panR = 1.0f;
+        int shape = ShapeSquare;
+        double pos = 0.0, step = 1.0, offsetR = 0.0;
+        double age = 0.0, length = 1.0, fade = 64.0;
+        double killAt = -1.0;          // when >= 0: quick fade starting at this age
+        float panL = 1.0f, panR = 1.0f, decay = 1.0f, pluck = 1.0f;
+
+        void fadeOut (double f)
+        {
+            if (killAt < 0.0) { killAt = age; fade = juce::jmax (1.0, juce::jmin (fade, f)); }
+        }
+
+        float envelope() const
+        {
+            const double x = age / length;
+            float e = 1.0f;
+            switch (shape)
+            {
+                case ShapeSoft:  { const double t = 0.35;   // Tukey window
+                                   if (x < t)            { const double s = std::sin (juce::MathConstants<double>::halfPi * x / t); e = (float) (s * s); }
+                                   else if (x > 1.0 - t) { const double s = std::sin (juce::MathConstants<double>::halfPi * (1.0 - x) / t); e = (float) (s * s); }
+                                   break; }
+                case ShapePluck: e = pluck; break;
+                case ShapeSwell: e = (float) (x < 0.85 ? std::pow (x / 0.85, 1.6) : 1.0); break;
+                default: break;
+            }
+            // short fades at both ends so nothing clicks
+            if (age < fade)               e *= (float) (0.5 - 0.5 * std::cos (juce::MathConstants<double>::pi * age / fade));
+            const double left = length - age;
+            if (left < fade)              e *= (float) (0.5 - 0.5 * std::cos (juce::MathConstants<double>::pi * juce::jmax (0.0, left) / fade));
+            if (killAt >= 0.0)
+            {
+                const double k = age - killAt;
+                e *= k >= fade ? 0.0f : (float) (0.5 + 0.5 * std::cos (juce::MathConstants<double>::pi * k / fade));
+            }
+            return e;
+        }
+
+        void advance()
+        {
+            age += 1.0;
+            if (shape == ShapePluck && age > fade) pluck *= decay;
+            if (age >= length || (killAt >= 0.0 && age - killAt >= fade)) active = false;
+        }
     };
 
     struct Voice
     {
-        bool active = false, held = false, gateOpen = true;
-        int note = 60, pad = 0, envStage = 0, rate = -100, dir = 1;
+        bool active = false, held = false, fireNow = false;
+        int note = 60, pad = 0, envStage = 0, rate = -100, dir = 1, triggers = 0;
         float velocity = 1.0f, env = 0.0f, gain = 1.0f;
-        double head = 0.0, regionStart = 0.0, regionEnd = 1.0, gate = 0.0, gateLeft = 0.0;
-        double grainAcc = 0.99, sinceRestart = 0.0;
+        double head = 0.0, regionStart = 0.0, regionEnd = 1.0, sinceTrigger = 1.0e12;
         juce::int64 lastTick = 0, age = 0;
         std::array<Grain, maxGrains> grains {};
         juce::Random rng;
     };
 
-    void restart (Voice& v, const Sample& s, double ppqNow, bool fromNote)
+    double fadeSamples() const { return 0.003 * sr; }
+
+    int effectiveRate (int pad) const
+    {
+        const int padRate = pads->rate[(size_t) pad].load();
+        if (padRate >= 0) return padRate;
+        return globals.sync ? globals.rate : -1;
+    }
+
+    float effectiveLength (int pad) const
+    {
+        const float padLen = pads->length[(size_t) pad].load();
+        return padLen >= 0.0f ? padLen : globals.lengthMs;
+    }
+
+    void setupRegion (Voice& v, const Sample& s, bool resetHead)
     {
         const int pad = v.pad;
         const int len = s.length();
@@ -289,78 +371,104 @@ private:
         v.regionStart = juce::jlimit (0.0, (double) len - 2.0, (double) a * len);
         v.regionEnd = juce::jlimit (v.regionStart + 8.0, (double) len - 1.0, (double) b * len);
         v.dir = pads->reverse[(size_t) pad].load() != 0 ? -1 : 1;
-        v.head = v.dir > 0 ? v.regionStart : v.regionEnd - 1.0;
         v.gain = pads->gain[(size_t) pad].load();
-        v.gateOpen = true;
-        v.grainAcc = 0.999;   // first grain right away
-
-        const int padRate = pads->rate[(size_t) pad].load();
-        const int rate = padRate >= 0 ? padRate : lastGlobalRate;
-        const double beats = rateBeats (rate);
-        const float padLen = pads->length[(size_t) pad].load();
-        const float length = padLen >= 0.0f ? padLen : lastGlobalLength;
-        v.gateLeft = beats > 0.0 ? juce::jmax (0.004 * sr, beats * 60.0 / juce::jmax (20.0, lastBpm) * sr * length) : 1.0e12;
-        if (fromNote)
+        if (resetHead)
         {
-            v.rate = rate;
-            v.lastTick = beats > 0.0 ? (juce::int64) std::floor (ppqNow / beats + 1.0e-9) : 0;
-        }
-        v.sinceRestart = 0.0;
-        if (act != nullptr)
-        {
-            const int w = act->restartWrite.load (std::memory_order_relaxed);
-            act->restartPad[(size_t) (w % Activity::restartSize)].store (pad);
-            act->restartWrite.store (w + 1, std::memory_order_release);
+            const double off = juce::jlimit (0.0, 0.999, (double) globals.position) * (v.regionEnd - v.regionStart);
+            v.head = v.dir > 0 ? v.regionStart + off : v.regionEnd - 1.0 - off;
         }
     }
 
-    void spawn (Voice& v, const Params& p, const Sample& s, double grainLen, double srcRatio)
+    void trigger (Voice& v, const Params& p, const Sample& s, double lenSamples, double srcRatio)
     {
+        auto& rng = v.rng;
+        v.sinceTrigger = 0.0;
+        ++v.triggers;
+        if (act != nullptr)
+        {
+            const int w = act->restartWrite.load (std::memory_order_relaxed);
+            act->restartPad[(size_t) (w % Activity::restartSize)].store (v.pad);
+            act->restartWrite.store (w + 1, std::memory_order_release);
+        }
+        // chaos: sometimes skip a hit (never the first one)
+        if (v.triggers > 1 && p.chaos > 0.0f && rng.nextFloat() < p.chaos * 0.22f) return;
+
         Grain* g = nullptr;
         for (auto& x : v.grains) if (! x.active) { g = &x; break; }
-        if (g == nullptr) return;
-        auto& rng = v.rng;
+        if (g == nullptr)
+        {
+            // all slots busy: start fading the oldest one so the next hit has room
+            for (auto& x : v.grains) if (x.active && x.killAt < 0.0) { x.fadeOut (fadeSamples()); break; }
+            return;
+        }
+
+        // pitch: global + chaos detune, octave jumps at higher chaos
+        double semis = p.pitch;
+        if (p.chaos > 0.0f)
+        {
+            semis += (rng.nextDouble() - 0.5) * 2.0 * p.chaos * 0.35;
+            if (rng.nextFloat() < juce::jmax (0.0f, p.chaos - 0.35f) * 0.45f) semis += rng.nextBool() ? 12.0 : -12.0;
+        }
+        int dir = v.dir;
+        if (p.chaos > 0.5f && rng.nextFloat() < (p.chaos - 0.5f) * 0.3f) dir = -dir;
+        const double speed = std::pow (2.0, semis / 12.0) * srcRatio;
         const double regionLen = v.regionEnd - v.regionStart;
 
-        double pos = v.head + (rng.nextDouble() - 0.5) * p.spread * regionLen
-                            + (rng.nextDouble() - 0.5) * p.chaos * regionLen * 0.5;
-        pos = juce::jlimit (v.regionStart, v.regionEnd - 2.0, pos);
+        double len = lenSamples * (1.0 + (rng.nextDouble() - 0.5) * 0.5 * p.chaos);
+        len = juce::jmax (0.004 * sr, juce::jmin (len, regionLen / speed));   // never read past the pad
+        const double span = len * speed;
 
-        double semis = p.pitch + (rng.nextDouble() - 0.5) * 2.0 * p.chaos * 0.6;
-        if (p.chaos > 0.0f && rng.nextFloat() < p.chaos * 0.15f) semis += rng.nextBool() ? 12.0 : -12.0;
-        const double step = std::pow (2.0, semis / 12.0) * srcRatio * v.dir;
-        const double len = grainLen * (1.0 + (rng.nextDouble() - 0.5) * 0.6 * p.chaos);
-        const float pan = 0.5f + (rng.nextFloat() - 0.5f) * juce::jmin (1.0f, p.chaos + p.spread * 0.6f);
+        double pos = v.head;
+        if (p.chaos > 0.0f) pos += (rng.nextDouble() - 0.5) * p.chaos * regionLen * 0.6;
+        // keep the whole grain inside the pad region
+        if (dir > 0) pos = juce::jlimit (v.regionStart, juce::jmax (v.regionStart, v.regionEnd - span - 2.0), pos);
+        else         pos = juce::jlimit (juce::jmin (v.regionEnd - 2.0, v.regionStart + span + 2.0), v.regionEnd - 2.0, pos);
+
+        // space: stereo placement + a tiny right-channel offset for width
+        const float side = (v.triggers % 2 == 0 ? 1.0f : -1.0f) * (0.35f + 0.65f * rng.nextFloat());
+        const float pan = 0.5f + 0.5f * p.space * side;
+        const double haas = p.space * (0.002 + 0.008 * rng.nextDouble()) * s.sampleRate;
 
         g->active = true;
+        g->shape = p.shape;
         g->pos = pos;
-        g->step = step;
+        g->step = speed * dir;
+        g->offsetR = dir > 0 ? juce::jmin (haas, juce::jmax (0.0, v.regionEnd - (pos + span) - 2.0))
+                             : -juce::jmin (haas, juce::jmax (0.0, pos - span - v.regionStart - 2.0));
         g->age = 0.0;
-        g->length = juce::jmax (16.0, len);
+        g->length = len;
+        g->killAt = -1.0;
+        g->fade = juce::jmin (fadeSamples(), len * 0.25);
+        g->pluck = 1.0f;
+        g->decay = (float) std::exp (-5.0 / len);
         g->panL = std::cos (pan * juce::MathConstants<float>::halfPi) * 1.41421f;
         g->panR = std::sin (pan * juce::MathConstants<float>::halfPi) * 1.41421f;
 
         if (act != nullptr)
         {
             const int w = act->grainWrite.load (std::memory_order_relaxed);
-            act->grainPos[(size_t) (w % Activity::size)].store ((float) (pos / juce::jmax (1, s.length())));
-            act->grainPad[(size_t) (w % Activity::size)].store (v.pad);
-            act->grainPitch[(size_t) (w % Activity::size)].store ((int) std::lround (semis));
+            const auto k = (size_t) (w % Activity::size);
+            const double slen = juce::jmax (1, s.length());
+            act->grainPos[k].store ((float) (pos / slen));
+            act->grainLen[k].store ((float) (span / slen) * (float) dir);
+            act->grainPan[k].store (pan);
+            act->grainPad[k].store (v.pad);
+            act->grainPitch[k].store ((int) std::lround (semis));
+            act->grainTime[k].store (clock);
             act->grainWrite.store (w + 1, std::memory_order_release);
         }
     }
 
 public:
-    // values restart() needs that live outside the voice
-    void setGlobals (const Params& p, double bpm) { lastGlobalRate = p.rate; lastGlobalLength = p.length; lastBpm = bpm; }
+    // values noteOn() needs that live outside the voice
+    void setGlobals (const Params& p, double bpm) { globals = p; lastBpm = bpm; }
 
 private:
     std::array<Voice, numVoices> voices {};
     PadState* pads = nullptr;
     Activity* act = nullptr;
-    double sr = 44100.0, lastBpm = 120.0;
-    int lastGlobalRate = 0;
-    float lastGlobalLength = 1.0f;
+    Params globals;
+    double sr = 44100.0, lastBpm = 120.0, clock = 0.0;
     juce::int64 seed = 0;
 };
 

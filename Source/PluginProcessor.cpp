@@ -18,7 +18,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout PrismaProcessor::createLayou
     auto db = AudioParameterFloatAttributes().withStringFromValueFunction ([] (float v, int) { return (v > 0.05f ? "+" : "") + String (v, 1) + " dB"; });
     auto st = AudioParameterFloatAttributes().withStringFromValueFunction ([] (float v, int) { return (v > 0.5f ? "+" : "") + String (roundToInt (v)) + " st"; });
     auto plain = AudioParameterFloatAttributes().withStringFromValueFunction ([] (float v, int) { return String (v, 2); });
-    auto perSec = AudioParameterFloatAttributes().withStringFromValueFunction ([] (float v, int) { return String (roundToInt (v)) + " /s"; });
+    auto hzFree = AudioParameterFloatAttributes().withStringFromValueFunction ([] (float v, int) { return String (v, v < 10.0f ? 1 : 0) + " Hz"; });
     auto speed = AudioParameterFloatAttributes().withStringFromValueFunction ([] (float v, int)
         { return v < 0.005f ? String ("freeze") : String (v, 2) + "x"; });
     auto bpm = AudioParameterFloatAttributes().withStringFromValueFunction ([] (float v, int)
@@ -29,14 +29,16 @@ juce::AudioProcessorValueTreeState::ParameterLayout PrismaProcessor::createLayou
     auto c = [&] (const char* id, const char* name, StringArray items, int def)
     { l.add (std::make_unique<AudioParameterChoice> (ParameterID { id, 1 }, name, items, def)); };
 
-    // grain
-    c ("rate", "Rate", rateNames(), 0);
-    f ("length", "Length", { 0.05f, 1.0f }, 1.0f, pct);
-    f ("grainSize", "Grain Size", { 10.0f, 500.0f, 0.0f, 0.45f }, 80.0f, ms);
-    f ("density", "Density", { 1.0f, 100.0f, 0.0f, 0.55f }, 30.0f, perSec);
+    // grains
+    l.add (std::make_unique<AudioParameterBool> (ParameterID { "sync", 1 }, "Grain Sync", true));
+    c ("rate", "Grain Rate", rateNames(), defaultRate);
+    f ("hz", "Grain Rate Free", { 0.5f, 60.0f, 0.0f, 0.45f }, 8.0f, hzFree);
+    f ("length", "Length", { minLengthMs, maxLengthMs, 0.0f, 0.45f }, 160.0f, ms);
+    c ("shape", "Shape", shapeNames(), 0);
+    f ("position", "Position", { 0.0f, 1.0f }, 0.0f, pct);
     f ("scan", "Scan", { 0.0f, 2.0f, 0.0f, 0.7f }, 1.0f, speed);
-    f ("spread", "Spread", { 0.0f, 1.0f, 0.0f, 0.6f }, 0.05f, pct);
     f ("chaos", "Chaos", { 0.0f, 1.0f }, 0.0f, pct);
+    f ("space", "Space", { 0.0f, 1.0f }, 0.3f, pct);
     f ("pitch", "Pitch", { -24.0f, 24.0f, 1.0f }, 0.0f, st);
     // slicing
     c ("divide", "Divide", divideNames(), 0);
@@ -93,13 +95,15 @@ Params PrismaProcessor::readParams() const
 {
     auto v = [this] (const char* id) { return apvts.getRawParameterValue (id)->load(); };
     Params p;
+    p.sync = v ("sync") > 0.5f;
     p.rate = (int) v ("rate");
-    p.length = v ("length");
-    p.grainMs = v ("grainSize");
-    p.density = v ("density");
+    p.hz = v ("hz");
+    p.lengthMs = v ("length");
+    p.shape = (int) v ("shape");
+    p.position = v ("position");
     p.scan = v ("scan");
-    p.spread = v ("spread");
     p.chaos = v ("chaos");
+    p.space = v ("space");
     p.pitch = v ("pitch");
     p.attack = v ("attack") * 0.001f;
     p.decayTime = v ("decayTime") * 0.001f;
@@ -152,6 +156,9 @@ void PrismaProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Midi
         if (cursor < n)
             engine.render (L + cursor, R + cursor, n - cursor, p, *smp, bpm, ppq + cursor * ppqPerSample, ppqPerSample);
     }
+
+    if (smp != nullptr) engine.publish (*smp, (double) samplesDone / sr);
+    samplesDone += n;
 
     FX::Settings s;
     auto v = [this] (const char* id) { return apvts.getRawParameterValue (id)->load(); };
@@ -255,8 +262,8 @@ void PrismaProcessor::setPadRegion (int pad, float start, float end)
     storePads();
 }
 
-void PrismaProcessor::setPadRate (int pad, int r)     { if (pad >= 0 && pad < maxPads) { pads.rate[(size_t) pad].store (juce::jlimit (-1, 13, r)); storePads(); } }
-void PrismaProcessor::setPadLength (int pad, float v) { if (pad >= 0 && pad < maxPads) { pads.length[(size_t) pad].store (v < 0.0f ? -1.0f : juce::jlimit (0.05f, 1.0f, v)); storePads(); } }
+void PrismaProcessor::setPadRate (int pad, int r)     { if (pad >= 0 && pad < maxPads) { pads.rate[(size_t) pad].store (juce::jlimit (-1, numRates - 1, r)); storePads(); } }
+void PrismaProcessor::setPadLength (int pad, float v) { if (pad >= 0 && pad < maxPads) { pads.length[(size_t) pad].store (v < 0.0f ? -1.0f : juce::jlimit (minLengthMs, maxLengthMs, v)); storePads(); } }
 void PrismaProcessor::setPadReverse (int pad, bool r) { if (pad >= 0 && pad < maxPads) { pads.reverse[(size_t) pad].store (r ? 1 : 0); storePads(); } }
 void PrismaProcessor::setPadGain (int pad, float g)   { if (pad >= 0 && pad < maxPads) { pads.gain[(size_t) pad].store (juce::jlimit (0.0f, 2.0f, g)); storePads(); } }
 
@@ -289,12 +296,13 @@ juce::String PrismaProcessor::padsToString() const
         items.add (juce::String (pads.start[(size_t) i].load(), 6) + ":" + juce::String (pads.end[(size_t) i].load(), 6) + ":"
                    + juce::String (pads.rate[(size_t) i].load()) + ":" + juce::String (pads.length[(size_t) i].load(), 4) + ":"
                    + juce::String (pads.reverse[(size_t) i].load()) + ":" + juce::String (pads.gain[(size_t) i].load(), 3));
-    return items.joinIntoString (";");
+    return "4|" + items.joinIntoString (";");   // 4| = v0.4 format (rate index without Off, length in ms)
 }
 
 void PrismaProcessor::padsFromString (const juce::String& text)
 {
-    auto items = juce::StringArray::fromTokens (text, ";", "");
+    const bool v4 = text.startsWith ("4|");
+    auto items = juce::StringArray::fromTokens (v4 ? text.fromFirstOccurrenceOf ("|", false, false) : text, ";", "");
     items.removeEmptyStrings();
     const int n = juce::jmin (maxPads, items.size());
     for (int i = 0; i < n; ++i)
@@ -303,8 +311,9 @@ void PrismaProcessor::padsFromString (const juce::String& text)
         if (f.size() < 6) continue;
         pads.start[(size_t) i].store (juce::jlimit (0.0f, 1.0f, f[0].getFloatValue()));
         pads.end[(size_t) i].store (juce::jlimit (0.0f, 1.0f, f[1].getFloatValue()));
-        pads.rate[(size_t) i].store (juce::jlimit (-1, 13, f[2].getIntValue()));
-        pads.length[(size_t) i].store (f[3].getFloatValue() < 0.0f ? -1.0f : juce::jlimit (0.05f, 1.0f, f[3].getFloatValue()));
+        // older projects: per-pad rate/length meant something else, so link them back to the globals
+        pads.rate[(size_t) i].store (v4 ? juce::jlimit (-1, numRates - 1, f[2].getIntValue()) : -1);
+        pads.length[(size_t) i].store (! v4 || f[3].getFloatValue() < 0.0f ? -1.0f : juce::jlimit (minLengthMs, maxLengthMs, f[3].getFloatValue()));
         pads.reverse[(size_t) i].store (f[4].getIntValue() != 0 ? 1 : 0);
         pads.gain[(size_t) i].store (juce::jlimit (0.0f, 2.0f, f[5].getFloatValue()));
     }
@@ -338,14 +347,15 @@ float PrismaProcessor::getParam (const juce::String& id) const
 void PrismaProcessor::dice()
 {
     auto& r = uiRandom;
-    const int rates[] = { 0, 0, 7, 8, 10, 10, 11, 12 };
+    const int rates[] = { 6, 7, 9, 9, 9, 10, 11, 12 };
+    setParam ("sync", 1.0f);
     setParam ("rate", (float) rates[r.nextInt (8)]);
-    setParam ("length", 0.35f + 0.65f * r.nextFloat());
-    setParam ("grainSize", 20.0f + 300.0f * r.nextFloat() * r.nextFloat());
-    setParam ("density", 8.0f + 60.0f * r.nextFloat());
-    setParam ("scan", r.nextFloat() < 0.25f ? 0.0f : 0.25f + 1.25f * r.nextFloat());
-    setParam ("spread", 0.3f * r.nextFloat() * r.nextFloat());
+    setParam ("length", 40.0f + 300.0f * r.nextFloat());
+    setParam ("shape", (float) (r.nextFloat() < 0.6f ? 0 : r.nextInt (4)));
+    setParam ("position", r.nextFloat() < 0.5f ? 0.0f : r.nextFloat());
+    setParam ("scan", r.nextFloat() < 0.3f ? 0.0f : 0.25f + 1.25f * r.nextFloat());
     setParam ("chaos", r.nextFloat() < 0.5f ? 0.0f : 0.6f * r.nextFloat());
+    setParam ("space", 0.2f + 0.6f * r.nextFloat());
     const float pitches[] = { 0, 0, 0, -12, 12, 7, -5 };
     setParam ("pitch", pitches[r.nextInt (7)]);
 }

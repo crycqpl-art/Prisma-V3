@@ -89,6 +89,7 @@ private:
     prisma::GrainEngine engine;
     prisma::FX fx;
     double sr = 44100.0, internalPpq = 0.0;
+    juce::int64 samplesDone = 0;
     juce::Random uiRandom;
     bool restoring = false;
 

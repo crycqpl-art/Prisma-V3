@@ -3,22 +3,84 @@
 
 using namespace prisma;
 
-static const juce::uint32 palette[] = { 0xffff2e88, 0xff2ee6ff, 0xffe8ff3a, 0xffff7a1a, 0xff9b5cff, 0xff3aff9e, 0xffff3a3a };
+namespace
+{
+// vacuum fluorescent display colours
+const juce::Colour vfd      (0xff5af5da);
+const juce::Colour vfdDim   (0xff175a50);
+const juce::Colour vfdFaint (0xff0b1a17);
+const juce::Colour vfdAmber (0xffffb84a);
+constexpr int dotPitch = 3;
+
+juce::Colour spectrum (float hue, float alpha = 1.0f)
+{
+    hue -= std::floor (hue);
+    return juce::Colour::fromHSV (hue, 0.62f, 1.0f, alpha);
+}
+
+juce::Image makeDots (int w, int h)
+{
+    juce::Image img (juce::Image::ARGB, juce::jmax (1, w), juce::jmax (1, h), true);
+    juce::Graphics g (img);
+    g.setColour (vfdFaint);
+    for (int y = 1; y < h; y += dotPitch)
+        for (int x = 1; x < w; x += dotPitch)
+            g.fillRect (x, y, 2, 2);
+    return img;
+}
+
+juce::Image makeVfdOverlay (int w, int h)
+{
+    w = juce::jmax (1, w); h = juce::jmax (1, h);
+    juce::Image img (juce::Image::ARGB, w, h, true);
+    juce::Graphics g (img);
+    // fine mesh in front of the glowing segments
+    g.setColour (juce::Colours::black.withAlpha (0.16f));
+    for (int y = 0; y < h; y += dotPitch) g.fillRect (0, y, w, 1);
+    juce::ColourGradient vig (juce::Colours::transparentBlack, (float) w * 0.5f, (float) h * 0.5f,
+                              juce::Colours::black.withAlpha (0.5f), 0.0f, 0.0f, true);
+    g.setGradientFill (vig);
+    g.fillRect (0, 0, w, h);
+    // smoked glass reflection
+    juce::Path p;
+    p.startNewSubPath (0.0f, 0.0f);
+    p.lineTo ((float) w * 0.62f, 0.0f);
+    p.lineTo ((float) w * 0.38f, (float) h * 0.5f);
+    p.lineTo (0.0f, (float) h * 0.5f);
+    p.closeSubPath();
+    juce::ColourGradient glass (juce::Colours::white.withAlpha (0.05f), 0.0f, 0.0f,
+                                juce::Colours::transparentWhite, 0.0f, (float) h * 0.5f, false);
+    g.setGradientFill (glass);
+    g.fillPath (p);
+    return img;
+}
+} // namespace
 
 //==============================================================================
 Display::Display (PrismaProcessor& p, std::function<void (int)> onSelect) : proc (p), select (std::move (onSelect))
 {
-    colA.fill (juce::Colours::magenta);
-    colB.fill (juce::Colours::cyan);
     readGrain = proc.activity.grainWrite.load();
     readRestart = proc.activity.restartWrite.load();
 }
 
-void Display::resized() { overlay = makeScreenOverlay (getWidth(), getHeight()); }
+void Display::resized()
+{
+    overlay = makeVfdOverlay (getWidth(), getHeight());
+    dots = makeDots (getWidth(), getHeight());
+    auto side = sideArea();
+    waterfall = juce::Image (juce::Image::ARGB, juce::jmax (1, (int) side.getWidth()), juce::jmax (1, (int) side.getHeight() - 74), true);
+    waveFor = nullptr;
+}
 
 juce::Rectangle<float> Display::waveArea() const
 {
-    return getLocalBounds().toFloat().reduced (18.0f, 0.0f).withTrimmedTop (34.0f).withTrimmedBottom (66.0f);
+    return getLocalBounds().toFloat().withTrimmedLeft (18.0f).withTrimmedRight (196.0f).withTrimmedTop (36.0f).withTrimmedBottom (66.0f);
+}
+
+juce::Rectangle<float> Display::sideArea() const
+{
+    auto w = waveArea();
+    return { w.getRight() + 22.0f, w.getY(), (float) getWidth() - 18.0f - (w.getRight() + 22.0f), w.getHeight() };
 }
 
 juce::Rectangle<float> Display::stripArea() const
@@ -48,41 +110,68 @@ float Display::snap (float norm, bool allowSnap) const
     return best;
 }
 
-void Display::drawWave (juce::Graphics& g, const Sample& s, juce::Rectangle<float> area, float from, float to,
-                        juce::Colour c, float xOffset) const
+juce::Point<float> Display::prismIn() const  { auto s = sideArea(); return { s.getCentreX() - 16.0f, s.getY() + 41.0f }; }
+juce::Point<float> Display::prismOut() const { auto s = sideArea(); return { s.getCentreX() + 2.0f, s.getY() + 62.0f }; }
+
+// The waveform as a mask of VFD dots, so pieces of it can be drawn in any colour and position.
+void Display::rebuildWave (const Sample& s)
 {
+    const auto wave = waveArea();
+    const int w = (int) wave.getWidth(), h = (int) wave.getHeight();
+    waveMask = juce::Image (juce::Image::SingleChannel, juce::jmax (1, w), juce::jmax (1, h), true);
+    waveFor = &s; waveW = w;
     if (s.overview.empty()) return;
-    g.setColour (c);
-    const float mid = area.getCentreY();
-    const float x0 = xOf (from), x1 = xOf (to);
+    juce::Graphics g (waveMask);
+    g.setColour (juce::Colours::white);
     const int nb = (int) s.overview.size();
-    for (float x = std::floor (x0); x < x1; x += 1.0f)
+    const int mid = (h / 2 / dotPitch) * dotPitch + 1;
+    for (int x = 1; x < w; x += dotPitch)
     {
-        const float n0 = normOf (x), n1 = normOf (x + 1.0f);
-        int b0 = (int) (n0 * (float) nb), b1 = juce::jmax (b0 + 1, (int) (n1 * (float) nb));
+        int b0 = (int) ((float) x / (float) w * (float) nb), b1 = juce::jmax (b0 + 1, (int) ((float) (x + dotPitch) / (float) w * (float) nb));
         float pk = 0.0f;
         for (int b = b0; b < b1 && b < nb; ++b) pk = juce::jmax (pk, s.overview[(size_t) b]);
-        const float a = juce::jmax (0.5f, pk * area.getHeight() * 0.47f);
-        g.fillRect (x + xOffset, mid - a, 1.0f, a * 2.0f);
+        const int a = (int) (pk * (float) h * 0.47f);
+        g.fillRect (x, mid, 2, 2);
+        for (int k = dotPitch; k <= a; k += dotPitch)
+        {
+            g.fillRect (x, mid - k, 2, 2);
+            g.fillRect (x, mid + k, 2, 2);
+        }
     }
+}
+
+void Display::drawMask (juce::Graphics& g, juce::Rectangle<float> clip, juce::Colour c, float dx, float dy) const
+{
+    if (! waveMask.isValid()) return;
+    const auto wave = waveArea();
+    juce::Graphics::ScopedSaveState ss (g);
+    g.reduceClipRegion (clip.translated (dx, dy).getSmallestIntegerContainer());
+    g.setColour (c);
+    g.drawImageAt (waveMask, (int) std::round (wave.getX() + dx), (int) std::round (wave.getY() + dy), true);
+}
+
+void Display::drawVfdText (juce::Graphics& g, const juce::String& t, juce::Rectangle<float> r, juce::Justification j, float size, juce::Colour c) const
+{
+    g.setFont (monoFont (size));
+    g.setColour (c.withAlpha (0.18f));
+    for (auto d : { juce::Point<float> (-1.0f, 0.0f), juce::Point<float> (1.0f, 0.0f), juce::Point<float> (0.0f, -1.0f), juce::Point<float> (0.0f, 1.0f) })
+        g.drawText (t, r.translated (d.x, d.y), j);
+    g.setColour (c);
+    g.drawText (t, r, j);
 }
 
 void Display::tick()
 {
     ++frame;
     auto& act = proc.activity;
-    const auto wave = waveArea();
+    auto smp = proc.getSample();
 
     const int rw = act.restartWrite.load (std::memory_order_acquire);
     if (rw - readRestart > Activity::restartSize) readRestart = rw - Activity::restartSize;
     for (; readRestart < rw; ++readRestart)
     {
         const int pad = act.restartPad[(size_t) (readRestart % Activity::restartSize)].load();
-        if (pad < 0 || pad >= maxPads) continue;
-        energy[(size_t) pad] = 1.0f;
-        const int a = rng.nextInt (7);
-        colA[(size_t) pad] = juce::Colour (palette[a]);
-        colB[(size_t) pad] = juce::Colour (palette[(a + 2 + rng.nextInt (4)) % 7]);
+        if (pad >= 0 && pad < maxPads) energy[(size_t) pad] = 1.0f;
     }
 
     const int gw = act.grainWrite.load (std::memory_order_acquire);
@@ -90,17 +179,44 @@ void Display::tick()
     int added = 0;
     for (; readGrain < gw; ++readGrain)
     {
-        if (++added > 40) continue;   // keep the screen readable at high densities
+        if (++added > 12) continue;   // keep the screen readable at very fast rates
         const auto i = (size_t) (readGrain % Activity::size);
-        const float x = xOf (act.grainPos[i].load());
-        const int pitch = act.grainPitch[i].load();
-        const float y = wave.getCentreY() - (float) pitch * wave.getHeight() / 60.0f + (rng.nextFloat() - 0.5f) * wave.getHeight() * 0.7f;
-        particles.push_back ({ x, y, 1.0f, 3.0f + rng.nextFloat() * 6.0f, juce::Colour (palette[rng.nextInt (7)]) });
+        const float pos = act.grainPos[i].load(), len = act.grainLen[i].load();
+        const float hue = 0.47f + (float) act.grainPitch[i].load() / 30.0f + (rng.nextFloat() - 0.5f) * 0.05f;
+        const float pan = act.grainPan[i].load();
+        tiles.push_back ({ juce::jmin (pos, pos + len), juce::jmax (pos, pos + len), 1.0f, hue, pan });
+        const double secs = smp != nullptr ? std::abs (len) * smp->seconds() : 0.1;
+        const auto wf = (float) waterfall.getWidth();
+        drops.push_back ({ 6.0f + pan * (wf - 12.0f), juce::jlimit (3.0f, 16.0f, 2.0f + (float) secs * 30.0f), hue,
+                           juce::jlimit (2, 90, (int) (secs * 60.0)) });
+        beam = 1.0f;
     }
-    for (auto& p : particles) { p.life -= 0.045f; p.y -= 0.4f; }
-    particles.erase (std::remove_if (particles.begin(), particles.end(), [] (const Particle& p) { return p.life <= 0.0f; }), particles.end());
-    if (particles.size() > 400) particles.erase (particles.begin(), particles.begin() + (long) (particles.size() - 400));
+    for (auto& t : tiles) t.life -= 0.032f;
+    tiles.erase (std::remove_if (tiles.begin(), tiles.end(), [] (const Tile& t) { return t.life <= 0.0f; }), tiles.end());
+    if (tiles.size() > 24) tiles.erase (tiles.begin(), tiles.begin() + (long) (tiles.size() - 24));
 
+    // rhythm waterfall: scroll down one line, print what sounds now on the top line
+    if (waterfall.isValid())
+    {
+        const int w = waterfall.getWidth(), h = waterfall.getHeight();
+        if (frame % 2 == 0)
+        {
+            waterfall.moveImageSection (0, 1, 0, 0, w, h - 1);
+            waterfall.clear ({ 0, 0, w, 1 });
+            juce::Graphics g (waterfall);
+            for (auto& d : drops)
+            {
+                g.setColour (spectrum (d.hue, 0.95f));
+                g.fillRect (d.x - d.w * 0.5f, 0.0f, d.w, 1.0f);
+                g.setColour (spectrum (d.hue + 0.08f, 0.35f));   // a thin split edge, like light through glass
+                g.fillRect (d.x + d.w * 0.5f, 0.0f, 2.0f, 1.0f);
+            }
+            for (auto& d : drops) --d.framesLeft;
+            drops.erase (std::remove_if (drops.begin(), drops.end(), [] (const Drop& d) { return d.framesLeft <= 0; }), drops.end());
+        }
+    }
+
+    beam *= 0.9f;
     for (auto& e : energy) e *= 0.9f;
     if (statusFrames > 0) --statusFrames;
     repaint();
@@ -111,18 +227,18 @@ void Display::paint (juce::Graphics& g)
     const auto bounds = getLocalBounds().toFloat();
     g.setColour (Theme::screen());
     g.fillRoundedRectangle (bounds, 6.0f);
+    g.drawImageAt (dots, 0, 0);
 
     auto smp = proc.getSample();
     const int n = proc.padCount();
     const auto wave = waveArea();
+    const auto side = sideArea();
 
-    // header
-    const auto header = bounds.reduced (18.0f, 0.0f).withHeight (30.0f).withY (6.0f);
-    g.setFont (monoFont (12.0f));
-    g.setColour (Theme::lcd());
+    // header line
+    const auto header = bounds.reduced (18.0f, 0.0f).withHeight (28.0f).withY (6.0f);
     juce::String left = "G-1  ";
     left << (smp != nullptr ? smp->name.toUpperCase().substring (0, 28) + "  " + juce::String (smp->seconds(), 2) + " S" : juce::String ("NO SAMPLE"));
-    g.drawText (left, header, juce::Justification::centredLeft);
+    drawVfdText (g, left, header, juce::Justification::centredLeft, 12.0f, vfd);
     const int divide = (int) proc.getParam ("divide");
     juce::String right;
     if (divide == DivideGrid)
@@ -131,85 +247,87 @@ void Display::paint (juce::Graphics& g)
     else if (divide == DivideEqual) right << "EQUAL " << countValue ((int) proc.getParam ("count"));
     else right << "TRANSIENTS";
     right << "   " << n << " PADS" << (proc.manualEdits ? " (EDITED)" : "");
-    g.drawText (right, header, juce::Justification::centredRight);
+    drawVfdText (g, right, header, juce::Justification::centredRight, 12.0f, vfd);
     if (statusFrames > 0 && (statusFrames > 40 || (frame / 6) % 2 == 0))
+        drawVfdText (g, status.toUpperCase(), header.reduced (250.0f, 0.0f), juce::Justification::centred, 12.0f, vfdAmber);
+
+    // grain rhythm readout above the prism
     {
-        g.setColour (juce::Colour (0xffffb23a));
-        g.drawText (status.toUpperCase(), header.reduced (240.0f, 0.0f), juce::Justification::centred);
+        juce::String gr;
+        if (proc.getParam ("sync") > 0.5f) gr << "GRAINS " << rateNames()[(int) proc.getParam ("rate")];
+        else gr << "GRAINS " << juce::String (proc.getParam ("hz"), 1) << " HZ";
+        gr << "  " << juce::roundToInt (proc.getParam ("length")) << " MS";
+        drawVfdText (g, gr, side.withHeight (14.0f).translated (0.0f, -2.0f), juce::Justification::centred, 10.0f, vfdDim.brighter (0.6f));
+    }
+
+    // prism: light comes in from the grains, leaves split into colours
+    {
+        const float cx = side.getCentreX(), top = side.getY() + 16.0f;
+        juce::Path tri;
+        tri.addTriangle (cx, top, cx - 32.0f, top + 50.0f, cx + 32.0f, top + 50.0f);
+        g.setColour (vfd.withAlpha (0.06f + 0.18f * beam));
+        g.fillPath (tri);
+        g.setColour (vfd.withAlpha (0.45f + 0.5f * beam));
+        g.strokePath (tri, juce::PathStrokeType (1.2f));
+        const auto out = prismOut();
+        const auto wf = juce::Rectangle<float> (side.getX(), side.getY() + 74.0f, side.getWidth(), side.getHeight() - 74.0f);
+        for (int k = 0; k < 7; ++k)
+        {
+            const float t = (float) k / 6.0f;
+            g.setColour (spectrum (0.02f + t * 0.75f, 0.1f + 0.75f * beam));
+            g.drawLine (out.x, out.y, wf.getX() + 6.0f + t * (wf.getWidth() - 12.0f), wf.getY(), 1.0f + beam);
+        }
+        // waterfall, fading as it falls
+        g.drawImageAt (waterfall, (int) wf.getX(), (int) wf.getY());
+        juce::ColourGradient fade (juce::Colours::transparentBlack, 0.0f, wf.getY(), Theme::screen().withAlpha (0.9f), 0.0f, wf.getBottom(), false);
+        g.setGradientFill (fade);
+        g.fillRect (wf);
+        g.setColour (vfdDim.withAlpha (0.6f));
+        g.drawRect (wf, 1.0f);
     }
 
     if (smp == nullptr)
     {
-        g.setColour (Theme::lcd());
-        g.setFont (monoFont (20.0f));
-        g.drawText (juce::String ("DROP A SAMPLE HERE") + ((frame / 30) % 2 == 0 ? "_" : " "), bounds.withTrimmedBottom (30.0f), juce::Justification::centred);
-        g.setColour (Theme::lcd().withAlpha (0.55f));
-        g.setFont (monoFont (12.0f));
-        g.drawText ("a loop, a vocal, a piece of a song: it gets sliced onto your keys from C1", bounds.withTrimmedTop (60.0f), juce::Justification::centred);
+        drawVfdText (g, juce::String ("DROP A SAMPLE HERE") + ((frame / 30) % 2 == 0 ? "_" : " "), wave.withTrimmedBottom (20.0f),
+                     juce::Justification::centred, 20.0f, vfd);
+        drawVfdText (g, "a loop, a vocal, a piece of a song: it gets sliced onto your keys from C1", wave.withTrimmedTop (50.0f),
+                     juce::Justification::centred, 11.0f, vfdDim.brighter (0.5f));
         if (proc.missingFile.isNotEmpty())
-        {
-            g.setColour (juce::Colour (0xffff6a4a));
-            g.drawText ("MISSING FILE: " + proc.missingFile.toUpperCase(), bounds.withTrimmedTop (120.0f), juce::Justification::centred);
-        }
+            drawVfdText (g, "MISSING FILE: " + proc.missingFile.toUpperCase(), wave.withTrimmedTop (110.0f), juce::Justification::centred, 11.0f, vfdAmber);
     }
     else
     {
-        // grid lines
+        if (waveFor != smp.get() || waveW != (int) wave.getWidth()) rebuildWave (*smp);
+
+        // grid as dotted lines
         if (divide == DivideGrid || proc.getParam ("snap") > 0.5f)
         {
-            g.setColour (juce::Colour (0xff1c1e22));
-            for (auto l : proc.snapLines()) g.fillRect (xOf (l), wave.getY(), 1.0f, wave.getHeight());
+            g.setColour (vfdDim.withAlpha (0.45f));
+            for (auto l : proc.snapLines())
+            {
+                const float x = std::round (xOf (l));
+                for (float y = wave.getY(); y < wave.getBottom(); y += 6.0f) g.fillRect (x, y, 1.0f, 2.0f);
+            }
         }
-        // base waveform
-        drawWave (g, *smp, wave, 0.0f, 1.0f, juce::Colour (0xff3a3e44), 0.0f);
 
-        // pad regions
+        // whole sample, dim
+        drawMask (g, wave, vfdDim, 0.0f, 0.0f);
+
+        // pad regions: lit while they play
         for (int i = 0; i < n; ++i)
         {
             const float a = proc.pads.start[(size_t) i].load(), b = proc.pads.end[(size_t) i].load();
             juce::Rectangle<float> r (xOf (a), wave.getY(), juce::jmax (1.0f, xOf (b) - xOf (a)), wave.getHeight());
             const float e = energy[(size_t) i];
-            if (e > 0.02f)
-            {
-                const auto ca = colA[(size_t) i], cb = colB[(size_t) i];
-                g.setColour (ca.withAlpha (0.08f * e));
-                g.fillRect (r);
-                const int bands = 6;
-                for (int k = 0; k < bands; ++k)
-                {
-                    auto band = r.withHeight (r.getHeight() / (float) bands).withY (r.getY() + r.getHeight() * (float) k / (float) bands);
-                    const float slip = (rng.nextFloat() - 0.5f) * e * juce::jmin (36.0f, r.getWidth() * 0.4f);
-                    const float dx = 1.5f + 6.0f * e;
-                    juce::Graphics::ScopedSaveState ss (g);
-                    g.reduceClipRegion (band.expanded (40.0f, 0.0f).getIntersection (wave).toNearestInt());
-                    drawWave (g, *smp, wave, a, b, ca.withAlpha (0.85f * e), slip - dx);
-                    drawWave (g, *smp, wave, a, b, cb.withAlpha (0.85f * e), slip + dx);
-                    drawWave (g, *smp, wave, a, b, juce::Colours::white.withAlpha (0.5f * e), slip);
-                }
-                if (rng.nextFloat() < 0.3f * e)
-                {
-                    g.setColour (cb.withAlpha (0.35f * e));
-                    g.fillRect (r.getX() - 4.0f, r.getY() + rng.nextFloat() * r.getHeight(), r.getWidth() + 8.0f, 1.0f + rng.nextFloat() * 2.5f);
-                }
-            }
-            // boundary tick and own-settings dot
-            g.setColour (juce::Colour (0xff5a5f66));
-            g.fillRect (r.getX(), wave.getY(), 1.0f, 8.0f);
-            g.fillRect (r.getX(), wave.getBottom() - 8.0f, 1.0f, 8.0f);
+            if (e > 0.02f) drawMask (g, r, vfd.withAlpha (0.25f + 0.75f * e), 0.0f, 0.0f);
+            g.setColour (vfdDim);
+            g.fillRect (r.getX(), wave.getY(), 1.0f, 6.0f);
+            g.fillRect (r.getX(), wave.getBottom() - 6.0f, 1.0f, 6.0f);
             if (proc.pads.hasOwnSettings (i))
             {
-                g.setColour (Theme::accent());
-                g.fillEllipse (r.getX() + 3.0f, wave.getY() + 3.0f, 5.0f, 5.0f);
+                g.setColour (vfdAmber);
+                g.fillRect (r.getX() + 3.0f, wave.getY() + 2.0f, 4.0f, 4.0f);
             }
-        }
-
-        // grains
-        for (auto& p : particles)
-        {
-            g.setColour (p.c.withAlpha (0.25f * p.life));
-            g.fillRect (p.x - p.size, p.y - p.size, p.size * 2.0f, p.size * 2.0f);
-            g.setColour (p.c.withAlpha (0.9f * p.life));
-            g.drawRect (p.x - p.size * 0.5f, p.y - p.size * 0.5f, p.size, p.size, 1.0f);
         }
 
         // selected pad frame with handles
@@ -217,15 +335,33 @@ void Display::paint (juce::Graphics& g)
         {
             const float a = proc.pads.start[(size_t) selected].load(), b = proc.pads.end[(size_t) selected].load();
             juce::Rectangle<float> r (xOf (a), wave.getY() - 2.0f, juce::jmax (2.0f, xOf (b) - xOf (a)), wave.getHeight() + 4.0f);
-            g.setColour (juce::Colours::white.withAlpha (0.06f));
-            g.fillRect (r);
-            g.setColour (juce::Colours::white.withAlpha (0.9f));
-            g.drawRect (r, 1.2f);
+            drawMask (g, r, vfd.withAlpha (0.55f), 0.0f, 0.0f);
+            g.setColour (vfd.withAlpha (0.85f));
+            g.drawRect (r, 1.0f);
             g.fillRect (r.getX() - 2.0f, r.getCentreY() - 12.0f, 4.0f, 24.0f);
             g.fillRect (r.getRight() - 2.0f, r.getCentreY() - 12.0f, 4.0f, 24.0f);
-            g.setFont (monoFont (11.0f));
-            g.drawText (juce::String (selected + 1).paddedLeft ('0', 2) + " " + noteName (firstPadNote + selected),
-                        juce::Rectangle<float> (r.getX() + 4.0f, r.getY() + 4.0f, 80.0f, 14.0f), juce::Justification::centredLeft);
+            drawVfdText (g, juce::String (selected + 1).paddedLeft ('0', 2) + " " + noteName (firstPadNote + selected),
+                         { r.getX() + 5.0f, r.getY() + 4.0f, 80.0f, 14.0f }, juce::Justification::centredLeft, 11.0f, vfd);
+        }
+
+        // lifted tiles: the piece of sound each grain plays rises out of the wave and splits into colour
+        for (auto& t : tiles)
+        {
+            const float age = 1.0f - t.life;
+            const float lift = -std::pow (age, 0.7f) * wave.getHeight() * 0.22f;
+            const float d = 1.0f + age * 9.0f;
+            juce::Rectangle<float> r (xOf (t.from), wave.getY(), juce::jmax (3.0f, xOf (t.to) - xOf (t.from)), wave.getHeight());
+            const float a = t.life * t.life;
+            drawMask (g, r, juce::Colour (0xffff4d6d).withAlpha (0.55f * a), -d, lift);
+            drawMask (g, r, juce::Colour (0xff4d7bff).withAlpha (0.55f * a), d, lift);
+            drawMask (g, r, spectrum (t.hue, 0.9f * a), 0.0f, lift);
+            if (t.life > 0.75f)
+            {
+                // the beam into the prism
+                const auto in = prismIn();
+                g.setColour (juce::Colours::white.withAlpha ((t.life - 0.75f) * 1.2f));
+                g.drawLine (r.getCentreX(), wave.getY() + wave.getHeight() * 0.5f + lift, in.x, in.y, 1.0f);
+            }
         }
 
         // playheads
@@ -233,40 +369,40 @@ void Display::paint (juce::Graphics& g)
         {
             const float lvl = proc.activity.voiceLevel[(size_t) v].load();
             if (proc.activity.voicePad[(size_t) v].load() < 0 || lvl < 0.01f) continue;
-            const float x = xOf (proc.activity.voicePos[(size_t) v].load());
-            g.setColour (juce::Colours::white.withAlpha (0.25f * lvl));
-            g.fillRect (x - 3.0f, wave.getY(), 6.0f, wave.getHeight());
-            g.setColour (juce::Colours::white.withAlpha (0.95f * lvl));
-            g.fillRect (x - 0.75f, wave.getY(), 1.5f, wave.getHeight());
+            const float x = std::round (xOf (proc.activity.voicePos[(size_t) v].load()));
+            g.setColour (vfd.withAlpha (0.2f * lvl));
+            g.fillRect (x - 3.0f, wave.getY(), 7.0f, wave.getHeight());
+            g.setColour (vfd.withAlpha (0.95f * lvl));
+            for (float y = wave.getY(); y < wave.getBottom(); y += (float) dotPitch) g.fillRect (x, y, 2.0f, 2.0f);
         }
 
         // pad strip
-        g.setFont (monoFont (n > 32 ? 9.0f : 10.5f));
         for (int i = 0; i < n; ++i)
         {
             auto c = padCell (i, n);
             const bool sel = i == selected;
             const float e = energy[(size_t) i];
-            if (sel) { g.setColour (Theme::lcd()); g.fillRect (c); }
+            if (sel) { g.setColour (vfd); g.fillRect (c); }
             else
             {
-                g.setColour (colA[(size_t) i].withAlpha (0.55f * e));
+                g.setColour (vfd.withAlpha (0.6f * e));
                 g.fillRect (c);
-                g.setColour (Theme::lcd().withAlpha (0.35f));
+                g.setColour (vfdDim);
                 g.drawRect (c, 1.0f);
             }
-            g.setColour (sel ? Theme::screen() : Theme::lcd().withAlpha (0.8f));
+            const auto tc = sel ? Theme::screen() : (e > 0.5f ? Theme::screen() : vfd.withAlpha (0.85f));
+            g.setColour (tc);
+            g.setFont (monoFont (n > 32 ? 9.0f : 10.5f));
             if (c.getWidth() > 13.0f) g.drawText (juce::String (i + 1), c.withTrimmedBottom (c.getHeight() * 0.45f), juce::Justification::centred);
             if (c.getWidth() > 22.0f)
             {
                 g.setFont (monoFont (8.5f));
                 g.drawText (noteName (firstPadNote + i), c.withTrimmedTop (c.getHeight() * 0.5f), juce::Justification::centred);
-                g.setFont (monoFont (n > 32 ? 9.0f : 10.5f));
             }
             if (proc.pads.hasOwnSettings (i))
             {
-                g.setColour (Theme::accent());
-                g.fillEllipse (c.getRight() - 6.0f, c.getY() + 2.0f, 4.0f, 4.0f);
+                g.setColour (vfdAmber);
+                g.fillRect (c.getRight() - 6.0f, c.getY() + 2.0f, 4.0f, 4.0f);
             }
         }
     }
@@ -274,7 +410,7 @@ void Display::paint (juce::Graphics& g)
     g.drawImageAt (overlay, 0, 0);
     if (dragOver)
     {
-        g.setColour (Theme::accent());
+        g.setColour (vfdAmber);
         juce::Path p, dashed;
         p.addRoundedRectangle (bounds.reduced (6.0f), 6.0f);
         const float dash[] = { 8.0f, 6.0f };
@@ -385,10 +521,12 @@ PrismaEditor::PrismaEditor (PrismaProcessor& p)
       divideKeys (p.apvts, "divide", 3), typeKeys (p.apvts, "gridType", 3, { "STR", "TRI", "DOT" }),
       bpmBar (p.apvts, "sampleBpm", "BPM"), sensBar (p.apvts, "sensitivity", "SENS"),
       snapToggle (p.apvts, "snap", "SNAP"),
-      rate (p.apvts, "rate", "RATE", true), length (p.apvts, "length", "LENGTH"),
-      grainSize (p.apvts, "grainSize", "GRAIN SIZE"), density (p.apvts, "density", "DENSITY"),
-      scan (p.apvts, "scan", "SCAN"), spread (p.apvts, "spread", "SPREAD"),
-      chaos (p.apvts, "chaos", "CHAOS"), pitch (p.apvts, "pitch", "PITCH"),
+      rate (p.apvts, "rate", "GRAINS", true), hz (p.apvts, "hz", "GRAINS", true),
+      length (p.apvts, "length", "LENGTH"), position (p.apvts, "position", "POSITION"),
+      scan (p.apvts, "scan", "SCAN"), pitch (p.apvts, "pitch", "PITCH"),
+      chaos (p.apvts, "chaos", "CHAOS"), space (p.apvts, "space", "SPACE"),
+      syncToggle (p.apvts, "sync", "SYNC"),
+      shapeKeys (p.apvts, "shape", 2, { "SQUARE", "SOFT", "PLUCK", "SWELL" }),
       rateLink ("LINK", [this] { if (proc.pads.rate[(size_t) selected].load() >= 0) proc.setPadRate (selected, -1);
                                  else proc.setPadRate (selected, (int) proc.getParam ("rate"));
                                  refreshPadPanel(); }),
@@ -438,19 +576,27 @@ PrismaEditor::PrismaEditor (PrismaProcessor& p)
         addAndMakeVisible (c);
 
     // pad knobs
-    padRate.slider.setRange (0.0, 13.0, 1.0);
-    padRate.slider.textFromValueFunction = [] (double v) { return rateNames()[juce::jlimit (0, 13, juce::roundToInt (v))]; };
+    padRate.slider.setRange (0.0, (double) (numRates - 1), 1.0);
+    padRate.slider.textFromValueFunction = [] (double v) { return rateNames()[juce::jlimit (0, numRates - 1, juce::roundToInt (v))]; };
     padRate.slider.onValueChange = [this] { if (! updatingPad) { proc.setPadRate (selected, juce::roundToInt (padRate.slider.getValue())); refreshPadPanel(); } };
-    padLength.slider.setRange (0.05, 1.0, 0.0);
-    padLength.slider.textFromValueFunction = [] (double v) { return juce::String (juce::roundToInt (v * 100.0)) + "%"; };
+    padLength.slider.setRange (minLengthMs, maxLengthMs, 0.0);
+    padLength.slider.setSkewFactor (0.45);
+    padLength.slider.textFromValueFunction = [] (double v) { return v >= 1000.0 ? juce::String ("1.00 s") : juce::String (juce::roundToInt (v)) + " ms"; };
     padLength.slider.onValueChange = [this] { if (! updatingPad) { proc.setPadLength (selected, (float) padLength.slider.getValue()); refreshPadPanel(); } };
-    rateLink.setTooltip ("On: this pad follows the main RATE. Turn the pad knob to give it its own.");
+    rateLink.setTooltip ("On: this pad follows the main GRAINS rate. Turn the pad knob to give it its own (always synced).");
+    rate.slider.setTooltip ("How often a grain fires, locked to the project grid");
+    hz.slider.setTooltip ("How often a grain fires, free (not locked to tempo)");
+    length.slider.setTooltip ("How long each grain plays. Longer than the grain rate = grains overlap");
+    position.slider.setTooltip ("Where in the pad the grains start");
+    scan.slider.setTooltip ("How fast the grains move through the pad. 1x = normal, 0 = freeze");
+    chaos.slider.setTooltip ("Random position, pitch, skipped hits, octaves and reverse grains");
+    space.slider.setTooltip ("Stereo width: grains spread left and right");
     lengthLink.setTooltip ("On: this pad follows the main LENGTH. Turn the pad knob to give it its own.");
     resetPadButton.onClick = [this] { proc.resetPad (selected); refreshPadPanel(); display.setStatus ("Pad reset"); };
     resetAllButton.onClick = [this] { proc.resetAllPads(); refreshPadPanel(); display.setStatus ("All pads reset"); };
 
     for (juce::Component* c : std::initializer_list<juce::Component*> {
-             &rate, &length, &grainSize, &density, &scan, &spread, &chaos, &pitch,
+             &rate, &hz, &syncToggle, &shapeKeys, &length, &position, &scan, &pitch, &chaos, &space,
              &padRate, &padLength, &rateLink, &lengthLink, &reverseButton, &resetPadButton, &resetAllButton,
              &attack, &decayTime, &sustain, &release, &lowCut, &highCut, &reso, &crunch, &wash, &pump, &volume })
         addAndMakeVisible (c);
@@ -522,6 +668,9 @@ void PrismaEditor::timerCallback()
     bpmBar.setVisible (divide == DivideGrid);
     countBox.setVisible (divide == DivideEqual);
     sensBar.setVisible (divide == DivideTransients);
+    const bool sync = proc.getParam ("sync") > 0.5f;
+    rate.setVisible (sync);
+    hz.setVisible (! sync);
 
     // linked pad knobs mirror the main ones
     if (! padRate.slider.isMouseButtonDown() && ! padLength.slider.isMouseButtonDown()) refreshPadPanel();
@@ -571,9 +720,8 @@ void PrismaEditor::paint (juce::Graphics& g)
     drawPanel (g, { 862, 684, 290, 108 }, "COLOR  /  OUT");
 
     g.setColour (Theme::label());
-    g.setFont (labelFont (10.5f, false));
-    g.drawFittedText ("RATE: hold a key and the pad restarts on the grid.\nOFF = smooth grain cloud.",
-                      juce::Rectangle<int> (44, 724, 180, 52), juce::Justification::centredLeft, 3);
+    drawTracked (g, "SHAPE", { (float) shapeKeys.getX(), (float) shapeKeys.getY() - 20.0f, 120.0f, 14.0f }, labelFont (10.0f), 1.8f,
+                 juce::Justification::centredLeft);
 }
 
 void PrismaEditor::resized()
@@ -598,15 +746,17 @@ void PrismaEditor::resized()
     resliceButton.setBounds (1050, 408, 102, 34);
 
     // grain panel
-    rate.setBounds (40, 482, 180, 236);
+    rate.setBounds (40, 482, 180, 222);
+    hz.setBounds (40, 482, 180, 222);
+    syncToggle.setBounds (70, 728, 120, 34);
     const int gx = 232, cw = 88;
     length.setBounds (gx, 480, cw, 130);
-    grainSize.setBounds (gx + cw, 480, cw, 130);
-    density.setBounds (gx + cw * 2, 480, cw, 130);
-    scan.setBounds (gx + cw * 3, 480, cw, 130);
-    spread.setBounds (gx, 640, cw, 130);
-    chaos.setBounds (gx + cw, 640, cw, 130);
-    pitch.setBounds (gx + cw * 2, 640, cw, 130);
+    position.setBounds (gx + cw, 480, cw, 130);
+    scan.setBounds (gx + cw * 2, 480, cw, 130);
+    pitch.setBounds (gx + cw * 3, 480, cw, 130);
+    chaos.setBounds (gx, 640, cw, 130);
+    space.setBounds (gx + cw, 640, cw, 130);
+    shapeKeys.setBounds (gx + cw * 2 + 6, 666, cw * 2 - 12, 92);
 
     // pad panel
     padRate.setBounds (612, 478, 104, 118);
